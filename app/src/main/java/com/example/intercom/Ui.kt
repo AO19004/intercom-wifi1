@@ -39,7 +39,7 @@ class IconToggle(
         set(v) { if (field != v) { field = v; refresh() } }
 
     init {
-        scaleType = ScaleType.FIT_CENTER
+        scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
         val p = ctx.dp(sizeDp * 24 / 100)
         setPadding(p, p, p, p)
         layoutParams = LinearLayout.LayoutParams(ctx.dp(sizeDp), ctx.dp(sizeDp))

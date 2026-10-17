@@ -228,7 +228,7 @@ class MainActivity : Activity() {
     }
 
     private fun makeRow(m: MasterEngine, s: ClientSession): Pair<View, Row> {
-        val colors = intArrayOf(0xFF1565C0, 0xFF2E7D32, 0xFFEF6C00, 0xFF6A1B9A, 0xFF00838F, 0xFFAD1457, 0xFF4E342E, 0xFF37474F).map { it.toInt() }
+        val colors = longArrayOf(0xFF1565C0, 0xFF2E7D32, 0xFFEF6C00, 0xFF6A1B9A, 0xFF00838F, 0xFFAD1457, 0xFF4E342E, 0xFF37474F).map { it.toInt() }
         val cc = colors[(s.id - 1) % colors.size]
         val c = card(cc, 3)
         val title = label(s.name, 16f, cc, true)

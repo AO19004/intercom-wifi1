@@ -10,7 +10,6 @@ import java.util.concurrent.Callable
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
@@ -28,11 +27,14 @@ class ClientSession(val id: Int, val addr: String) {
 class MasterEngine(private val io: AudioIO) {
     val sessions = CopyOnWriteArrayList<ClientSession>()
     @Volatile var micOpen = true       // میکروفون مستر برای همه
+    @Volatile var conference = false   // کلاینت‌ها همدیگر را بشنوند
+    @Volatile var lockedCount = 0      // 0 = قفل نیست
     @Volatile var myLevel = 0
     @Volatile var serverStatus = "در حال راه‌اندازی…"
     @Volatile var audioOk = true
     @Volatile var autoScan = true
     @Volatile var scanStatus = ""
+    @Volatile private var known: Set<String> = emptySet()   // IP کلاینت‌ها در لحظه‌ی قفل
     @Volatile private var running = false
     private var server: ServerSocket? = null
     private var nextId = 1
@@ -60,16 +62,43 @@ class MasterEngine(private val io: AudioIO) {
         }
         thread(name = "autoscan") {
             Thread.sleep(1500)
+            var miss = 0
             while (running) {
-                if (autoScan && sessions.size < MAX_CLIENTS) scanNow()
-                Thread.sleep(8000)
+                if (autoScan) {
+                    val lc = lockedCount
+                    if (lc == 0) {
+                        if (sessions.size < MAX_CLIENTS) scanNow()
+                    } else if (sessions.size >= lc) {
+                        miss = 0                                   // تعداد کامل است: جستجو نکن
+                        known = sessions.map { it.addr }.toSet()
+                    } else {
+                        val missing = known.filter { ip -> sessions.none { it.addr == ip } }
+                        if (miss < 3 && missing.isNotEmpty()) { if (scanNow(missing)) miss++ }  // اول همان IPها
+                        else scanNow()                                                           // بعد جستجوی کلی
+                    }
+                }
+                Thread.sleep(5000)
             }
         }
         thread(name = "mic") { micLoop() }
         thread(name = "mix") { mixLoop() }
     }
 
-    // ---------- جستجوی خودکار کلاینت‌ها در رنج IP ----------
+    // ---------- قفل تعداد کلاینت‌ها ----------
+    fun lock(): Boolean {
+        if (sessions.isEmpty()) return false
+        lockedCount = sessions.size
+        known = sessions.map { it.addr }.toSet()
+        scanStatus = "قفل شد روی $lockedCount کلاینت"
+        return true
+    }
+
+    fun unlock() { lockedCount = 0; scanStatus = "قفل باز شد" }
+
+    /** نگه داشتن ۳ ثانیه‌ای: قفل باز و جستجوی کلی از نو */
+    fun fullSearch() { lockedCount = 0; known = emptySet(); scanNow() }
+
+    // ---------- جستجوی کلاینت‌ها در رنج IP ----------
     private fun localAddrs(): List<String> = try {
         NetworkInterface.getNetworkInterfaces().toList()
             .filter { it.isUp && !it.isLoopback && !it.name.matches(Regex("(rmnet|ccmni|tun|ppp|dummy|v4-|clat|tap).*")) }
@@ -77,18 +106,20 @@ class MasterEngine(private val io: AudioIO) {
             .filter { it.isNotEmpty() }
     } catch (_: Exception) { emptyList() }
 
-    fun scanNow() {
-        if (!scanning.compareAndSet(false, true)) return
+    /** only = فقط همین IPها؛ null = کل رنج شبکه. true یعنی جستجو شروع شد */
+    fun scanNow(only: List<String>? = null): Boolean {
+        if (!scanning.compareAndSet(false, true)) return false
         thread(name = "scan") {
             try {
                 val own = localAddrs()
                 val prefixes = own.map { it.substringBeforeLast('.') }.distinct()
-                val targets = prefixes.flatMap { p -> (1..254).map { "$p.$it" } }
+                val targets: List<String> = (only ?: prefixes.flatMap { p -> (1..254).map { "$p.$it" } })
                     .filter { it !in own }.filter { ip -> sessions.none { it.addr == ip } }
-                if (targets.isEmpty()) { scanStatus = "شبکه‌ای برای جستجو پیدا نشد"; return@thread }
-                scanStatus = "در حال جستجو در ${prefixes.joinToString(", ") { "$it.x" }} …"
+                if (targets.isEmpty()) { scanStatus = "موردی برای جستجو نیست"; return@thread }
+                scanStatus = if (only != null) "جستجوی IPهای قبلی…"
+                             else "در حال جستجو در ${prefixes.joinToString(", ") { "$it.x" }} …"
                 val hits = AtomicInteger()
-                val pool = Executors.newFixedThreadPool(48)
+                val pool = Executors.newFixedThreadPool(minOf(48, targets.size))
                 val tasks = targets.map { ip ->
                     Callable<Unit> {
                         try {
@@ -102,6 +133,7 @@ class MasterEngine(private val io: AudioIO) {
                 scanStatus = "جستجو تمام شد: ${hits.get()} کلاینت دعوت شد"
             } finally { scanning.set(false) }
         }
+        return true
     }
 
     private fun addClient(sock: Socket) {
@@ -138,17 +170,37 @@ class MasterEngine(private val io: AudioIO) {
     }
 
     private fun mixLoop() {
-        val acc = IntArray(FRAME)
+        val acc = IntArray(FRAME)   // آنچه مستر می‌شنود (با میوت و ولوم)
+        val tot = IntArray(FRAME)   // مجموع خام همه‌ی کلاینت‌ها برای حالت گفتگو
         val out = ShortArray(FRAME)
+        val cf = ShortArray(FRAME)
         while (running) {
-            java.util.Arrays.fill(acc, 0)
-            for (s in sessions) {
-                if (s.muted) { s.inQ.clear(); s.level = 0; continue }
+            java.util.Arrays.fill(acc, 0); java.util.Arrays.fill(tot, 0)
+            val ss = sessions.toList()
+            val frames = arrayOfNulls<ShortArray>(ss.size)
+            var nn = 0
+            for ((k, s) in ss.withIndex()) {
                 val f = s.inQ.poll()
+                frames[k] = f
                 if (f == null) { s.level = 0; continue }
-                s.level = f.peak()
+                nn++
+                s.level = if (s.muted) 0 else f.peak()
                 val g = s.volume
-                for (i in 0 until FRAME) acc[i] += (f[i] * g).toInt()
+                for (i in 0 until FRAME) {
+                    tot[i] += f[i].toInt()
+                    if (!s.muted) acc[i] += (f[i] * g).toInt()
+                }
+            }
+            if (conference && nn > 0) {
+                for ((k, s) in ss.withIndex()) {
+                    val own = frames[k]
+                    if (nn - (if (own != null) 1 else 0) <= 0) continue   // کسی غیر از خودش صحبت نمی‌کند
+                    for (i in 0 until FRAME) {
+                        val v = tot[i] - (own?.get(i)?.toInt() ?: 0)
+                        cf[i] = v.coerceIn(-32768, 32767).toShort()
+                    }
+                    s.link.send(T_CONF, cf.toBytes())
+                }
             }
             for (i in 0 until FRAME) out[i] = acc[i].coerceIn(-32768, 32767).toShort()
             if (!io.write(out)) Thread.sleep(20)   // write() بلوکه می‌شود و ساعت ۲۰ms را می‌سازد
@@ -165,6 +217,8 @@ class MasterEngine(private val io: AudioIO) {
 class ClientEngine(private val io: AudioIO, initialHost: String, private val name: String) {
     @Volatile var host = initialHost   // خالی = منتظر پیدا شدن توسط مستر
     @Volatile var micMuted = false
+    @Volatile var masterMuted = false  // میوت صدای مستر (فقط برای خودم)
+    @Volatile var masterVolume = 1f    // 0..2
     @Volatile var masterTalking = true
     @Volatile var status = "…"
     @Volatile var audioOk = true
@@ -172,7 +226,8 @@ class ClientEngine(private val io: AudioIO, initialHost: String, private val nam
     @Volatile private var running = false
     @Volatile private var link: Link? = null
     private var disc: ServerSocket? = null
-    private val inQ = ArrayBlockingQueue<ShortArray>(8)
+    private val inQ = ArrayBlockingQueue<ShortArray>(8)     // صدای مستر
+    private val confQ = ArrayBlockingQueue<ShortArray>(8)   // صدای بقیه‌ی کلاینت‌ها
 
     fun start() {
         running = true
@@ -188,7 +243,7 @@ class ClientEngine(private val io: AudioIO, initialHost: String, private val nam
                     s.connect(InetSocketAddress(h, PORT), 5000)
                     s.soTimeout = 15000
                     val l = Link(s, { t, d -> onMsg(t, d) }, { latch.countDown() })
-                    inQ.clear(); link = l; l.start()
+                    inQ.clear(); confQ.clear(); link = l; l.start()
                     l.send(T_HELLO, name.toByteArray(Charsets.UTF_8))
                     status = "متصل"
                     latch.await()
@@ -222,10 +277,19 @@ class ClientEngine(private val io: AudioIO, initialHost: String, private val nam
                 else { level = f.peak(); link?.send(T_AUDIO, f.toBytes()) }
             }
         }
-        thread(name = "play") {
+        thread(name = "play") {   // هر ۲۰ms یک فریم از مستر + یک فریم از بقیه‌ی کلاینت‌ها میکس می‌شود
+            val out = ShortArray(FRAME)
             while (running) {
-                val f = inQ.poll(40, TimeUnit.MILLISECONDS) ?: continue
-                if (!io.write(f)) Thread.sleep(20)
+                val a = inQ.poll()
+                val b = confQ.poll()
+                val g = if (masterMuted) 0f else masterVolume
+                for (i in 0 until FRAME) {
+                    var v = 0
+                    if (a != null) v += (a[i] * g).toInt()
+                    if (b != null) v += b[i].toInt()
+                    out[i] = v.coerceIn(-32768, 32767).toShort()
+                }
+                if (!io.write(out)) Thread.sleep(20)
             }
         }
     }
@@ -233,6 +297,7 @@ class ClientEngine(private val io: AudioIO, initialHost: String, private val nam
     private fun onMsg(t: Int, d: ByteArray) {
         when (t) {
             T_AUDIO -> if (d.size == FRAME * 2) inQ.pushDrop(d.toShorts())
+            T_CONF -> if (d.size == FRAME * 2) confQ.pushDrop(d.toShorts())
             T_CTRL -> if (d.isNotEmpty()) masterTalking = d[0].toInt() == 1
         }
     }

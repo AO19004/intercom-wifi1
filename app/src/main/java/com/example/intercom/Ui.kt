@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.drawable.GradientDrawable
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.View
 import android.widget.ImageButton
 import android.widget.LinearLayout
@@ -38,6 +40,15 @@ class IconToggle(
     var on: Boolean = true
         set(v) { if (field != v) { field = v; refresh() } }
 
+    /** اگر مقدار داشته باشد، نگه داشتن ۳ ثانیه‌ای کلید آن را اجرا می‌کند */
+    var onHold: (() -> Unit)? = null
+    private var holdFired = false
+    private val holdRun = Runnable {
+        holdFired = true; isPressed = false
+        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+        onHold?.invoke()
+    }
+
     init {
         scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
         val p = ctx.dp(sizeDp * 24 / 100)
@@ -47,6 +58,21 @@ class IconToggle(
         if (interactive) setOnClickListener { if (toggle) on = !on; onChange(on) }
         else { isClickable = false; isFocusable = false }
         refresh()
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        if (onHold != null) {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { holdFired = false; postDelayed(holdRun, 3000) }
+                MotionEvent.ACTION_MOVE -> if (e.x < 0 || e.y < 0 || e.x > width || e.y > height) removeCallbacks(holdRun)
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> removeCallbacks(holdRun)
+            }
+            if (holdFired) {
+                if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL) holdFired = false
+                return true
+            }
+        }
+        return super.onTouchEvent(e)
     }
 
     fun setIcon(res: Int) { if (res != onIcon) { onIcon = res; offIcon = res; refresh() } }

@@ -42,6 +42,8 @@ class IconToggle(
 
     /** اگر مقدار داشته باشد، نگه داشتن ۳ ثانیه‌ای کلید آن را اجرا می‌کند */
     var onHold: (() -> Unit)? = null
+    /** اگر مقدار داشته باشد کلید «نگه‌دار و صحبت کن» می‌شود: true هنگام فشردن، false هنگام رها کردن */
+    var onPress: ((Boolean) -> Unit)? = null
     private var holdFired = false
     private val holdRun = Runnable {
         holdFired = true; isPressed = false
@@ -61,6 +63,14 @@ class IconToggle(
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
+        val pr = onPress
+        if (pr != null) {
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { parent?.requestDisallowInterceptTouchEvent(true); isPressed = true; pr(true) }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> { isPressed = false; pr(false) }
+            }
+            return true
+        }
         if (onHold != null) {
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> { holdFired = false; postDelayed(holdRun, 3000) }

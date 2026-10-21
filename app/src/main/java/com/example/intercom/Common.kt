@@ -12,12 +12,37 @@ import kotlin.math.abs
 const val RATE = 16000          // 16 kHz mono PCM16
 const val FRAME = 320           // 20 ms
 const val PORT = 50505
-const val MAX_CLIENTS = 16      // حداقل ۱۰ لازم بود؛ ۱۶ برای اطمینان
+const val DISC_PORT = 50506     // پورت شنود کلاینت برای پیدا شدن توسط مستر
+const val FILE_PORT = 50507     // پورت انتقال فایل روی مستر
+const val MAX_CLIENTS = 16
 
-const val T_HELLO = 1           // نام کلاینت
-const val T_AUDIO = 2           // یک فریم صدا (640 بایت)
-const val T_PING = 3
-const val T_CTRL = 4            // مستر -> کلاینت: ۱ = مستر با تو صحبت می‌کند
+const val T_HELLO = 1           // کلاینت -> مستر: نام + \u0001 + رمز
+const val T_AUDIO = 2           // یک فریم صدا (PCM خام یا ADPCM)
+const val T_PING = 3            // مستر -> کلاینت: زمان (۸ بایت) برای اندازه‌گیری تأخیر
+const val T_CTRL = 4            // مستر -> کلاینت: [مستر صحبت می‌کند، گروه، ضبط]
+const val T_CONF = 5            // مستر -> کلاینت: صدای سایر کلاینت‌ها (حالت گفتگو)
+const val T_BUZZ = 6            // درخواست ویبره
+const val T_STATE = 7           // کلاینت -> مستر: وضعیت میوت‌ها (ضربان هم هست)
+const val T_DENY = 8            // مستر -> کلاینت: رمز اشتباه
+const val T_PONG = 9            // کلاینت -> مستر: پاسخ T_PING
+const val T_CMD = 10            // مستر -> کلاینت: ۱ = میکروفون کلاینت بسته شود، ۰ = آزاد
+const val T_MSG = 11            // پیام متنی کوتاه
+const val T_FILE = 12           // مستر -> کلاینت: پیشنهاد فایل [شناسه(8) حجم(8) نام]
+
+object Cfg {
+    @Volatile var compress = true   // فشرده‌سازی ADPCM (۴ برابر کمتر)
+    @Volatile var noise = true      // حذف نویز + AGC
+    @Volatile var buzzBeep = false  // همراه ویبره بوق هم بزند
+}
+
+fun encodeFrame(f: ShortArray): ByteArray = if (Cfg.compress) Adpcm.encode(f) else f.toBytes()
+
+/** هر دو فرمت (خام و فشرده) پذیرفته می‌شود تا تنظیم دو طرف مستقل باشد */
+fun decodeFrame(d: ByteArray): ShortArray? = when (d.size) {
+    FRAME * 2 -> d.toShorts()
+    3 + FRAME / 2 -> Adpcm.decode(d, FRAME)
+    else -> null
+}
 
 fun ShortArray.toBytes(): ByteArray {
     val b = ByteArray(size * 2)
@@ -95,5 +120,3 @@ class Link(
         onClose()
     }
 }
-const val DISC_PORT = 50506     // پورت شنود کلاینت برای پیدا شدن توسط مستر
-const val T_CONF = 5            // مستر -> کلاینت: صدای سایر کلاینت‌ها (حالت گفتگو)

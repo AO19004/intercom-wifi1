@@ -2,6 +2,7 @@ package com.example.intercom
 
 import android.Manifest
 import android.app.Activity
+import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
@@ -13,8 +14,13 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.text.InputFilter
+import android.text.InputType
 import android.view.Gravity
 import android.view.View
+import android.view.animation.AlphaAnimation
+import android.view.animation.Animation
 import android.widget.*
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -23,13 +29,23 @@ class MainActivity : Activity() {
     private val h = Handler(Looper.getMainLooper())
     private lateinit var box: LinearLayout
     private var afterPerm: (() -> Unit)? = null
+    private val GC = intArrayOf(C_BLUE, C_GREEN, C_AMBER, 0xFF6A1B9A.toInt())   // رنگ گروه‌های A..D
 
-    private class Row(val s: ClientSession, val title: TextView, val bar: LevelBar, val sp: IconToggle, val mic: IconToggle)
+    private class Row(
+        val s: ClientSession, val title: TextView, val quality: TextView, val note: TextView, val bar: LevelBar,
+        val sp: IconToggle, val mic: IconToggle, val solo: IconToggle, val remote: IconToggle, val grp: TextView,
+        val ptt: IconToggle, val blink: ImageView
+    ) { var prev = false; var blinking = false }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         volumeControlStream = AudioManager.STREAM_VOICE_CALL
         window.statusBarColor = C_BLUE
+        val sp = getSharedPreferences("p", 0)
+        Cfg.compress = sp.getBoolean("compress", true)
+        Cfg.noise = sp.getBoolean("noise", true)
+        Cfg.buzzBeep = sp.getBoolean("buzzBeep", false)
+        Intercom.appCtx = applicationContext
         val sv = ScrollView(this).apply { setBackgroundColor(C_BG) }
         box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(12), dp(12), dp(24)) }
         sv.addView(box); setContentView(sv)
@@ -56,7 +72,6 @@ class MainActivity : Activity() {
 
     private fun add(v: View) = box.addView(v, lp(b = 12))
 
-    /** آیکون + عنوان کوچک زیرش */
     private fun col(v: View, cap: String) = LinearLayout(this).apply {
         orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
         addView(v); addView(label(cap, 11f, C_GRAY).apply { gravity = Gravity.CENTER })
@@ -87,13 +102,87 @@ class MainActivity : Activity() {
         return c
     }
 
+    private fun chip(text: String, color: Int, sizeDp: Int, click: () -> Unit) = TextView(this).apply {
+        this.text = text; textSize = 18f; setTextColor(Color.WHITE); setTypeface(typeface, Typeface.BOLD); gravity = Gravity.CENTER
+        background = shape(color, oval = true); elevation = dp(3).toFloat()
+        layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp))
+        setOnClickListener { click() }
+    }
+
+    private fun setChip(tv: TextView, text: String, color: Int) {
+        if (tv.text.toString() != text) tv.text = text
+        tv.textSize = if (text.length > 1) 14f else 18f
+        tv.background = shape(color, oval = true)
+    }
+
+    private fun pill(text: String, color: Int = C_BLUE, click: () -> Unit) = TextView(this).apply {
+        this.text = text; textSize = 14f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+        setPadding(dp(10), dp(10), dp(10), dp(10)); background = shape(color, radiusDp = 20)
+        setOnClickListener { click() }
+    }
+
+    private fun loadMsgs(): MutableList<String> {
+        val raw = getSharedPreferences("p", 0).getString("msgs", null)
+        val l = raw?.split("\n")?.filter { it.isNotBlank() }?.toMutableList()
+        return if (l == null || l.isEmpty()) mutableListOf("بیا", "صبر کن", "تمام شد", "کمک", "باشه") else l
+    }
+
+    private fun saveMsgs(l: List<String>) { getSharedPreferences("p", 0).edit().putString("msgs", l.joinToString("\n")).apply() }
+
+    /** پیام جدید (index = -1) یا ویرایش/حذف پیام موجود */
+    private fun editMsg(index: Int, done: () -> Unit) {
+        val list = loadMsgs()
+        val et = EditText(this).apply {
+            setText(if (index >= 0) list[index] else ""); hint = "متن پیام"; setSingleLine(true)
+            filters = arrayOf<InputFilter>(InputFilter.LengthFilter(60))
+        }
+        val b = AlertDialog.Builder(this).setTitle(if (index >= 0) "ویرایش پیام" else "پیام جدید").setView(et)
+            .setPositiveButton("ذخیره") { _, _ ->
+                val t = et.text.toString().trim().replace("\n", " ")
+                if (t.isNotEmpty()) {
+                    if (index >= 0) list[index] = t else if (list.size < 20) list.add(t) else toast("حداکثر ۲۰ پیام")
+                    saveMsgs(list); done()
+                }
+            }
+            .setNegativeButton("لغو", null)
+        if (index >= 0) b.setNeutralButton("حذف") { _, _ -> list.removeAt(index); saveMsgs(list); done() }
+        b.show()
+    }
+
+    private fun quickMsgs(send: (String) -> Unit): LinearLayout {
+        val c = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        var editing = false
+        fun rebuild() {
+            c.removeAllViews()
+            val list = loadMsgs()
+            fun w() = LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(3), dp(3), dp(3), dp(3)) }
+            var r = row()
+            c.addView(r)
+            list.forEachIndexed { i, text ->
+                if (i > 0 && i % 3 == 0) { r = row(); c.addView(r) }
+                r.addView(pill(if (editing) "✏ $text" else text, if (editing) C_AMBER else C_BLUE) {
+                    if (editing) editMsg(i) { rebuild() } else send(text)
+                }, w())
+            }
+            val tools = row()
+            tools.addView(pill("➕ پیام جدید", C_GREEN) { editMsg(-1) { rebuild() } }, w())
+            tools.addView(pill(if (editing) "✔ پایان ویرایش" else "✏ ویرایش", C_GRAY) { editing = !editing; rebuild() }, w())
+            c.addView(tools, lp(t = 8))
+        }
+        rebuild()
+        return c
+    }
+
+    private fun groupLetter(g: Int) = ('A' + (g.coerceIn(1, 4) - 1)).toString()
+    private fun qColor(q: Int) = when { q < 0 -> C_GRAY; q < 80 -> C_GREEN; q < 200 -> C_AMBER; else -> C_RED }
+
     private fun routeIcon(): Int {
         val n = Intercom.router?.routeName ?: ""
         return when { n.startsWith("هدست") -> R.drawable.ic_headset; n.startsWith("گوشی") -> R.drawable.ic_phone; else -> R.drawable.ic_speaker }
     }
 
-    private fun routeBtn() = IconToggle(this, R.drawable.ic_speaker, R.drawable.ic_speaker, 64, C_BLUE, C_BLUE, toggle = false) { toggleSpeaker() }
-    private fun endBtn() = IconToggle(this, R.drawable.ic_power, R.drawable.ic_power, 64, C_RED, C_RED, toggle = false) { stopSvc() }
+    private fun routeBtn(size: Int = 64) = IconToggle(this, R.drawable.ic_speaker, R.drawable.ic_speaker, size, C_BLUE, C_BLUE, toggle = false) { toggleSpeaker() }
+    private fun endBtn(size: Int = 64) = IconToggle(this, R.drawable.ic_power, R.drawable.ic_power, size, C_RED, C_RED, toggle = false) { stopSvc() }
 
     private fun toast(t: String) = Toast.makeText(this, t, Toast.LENGTH_SHORT).show()
 
@@ -107,6 +196,39 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun settingsSwitches(): LinearLayout {
+        val sp = getSharedPreferences("p", 0)
+        val c = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        c.addView(Switch(this).apply {
+            text = "فشرده‌سازی صدا (مصرف اینترنت کمتر)"; isChecked = Cfg.compress
+            setOnCheckedChangeListener { _, v -> Cfg.compress = v; sp.edit().putBoolean("compress", v).apply() }
+        })
+        c.addView(Switch(this).apply {
+            text = "حذف نویز و تنظیم خودکار بلندی میکروفون"; isChecked = Cfg.noise
+            setOnCheckedChangeListener { _, v -> Cfg.noise = v; sp.edit().putBoolean("noise", v).apply(); Intercom.io?.restart() }
+        })
+        c.addView(Switch(this).apply {
+            text = "بوق همراه ویبره (اگر ویبره کار نمی‌کند)"; isChecked = Cfg.buzzBeep
+            setOnCheckedChangeListener { _, v -> Cfg.buzzBeep = v; sp.edit().putBoolean("buzzBeep", v).apply() }
+        })
+        c.addView(pill("استثنا از محدودیت باتری") { askBattery(true) }, lp(t = 8))
+        return c
+    }
+
+    private fun askBattery(force: Boolean = false) {
+        if (Build.VERSION.SDK_INT < 23) return
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        if (pm.isIgnoringBatteryOptimizations(packageName)) { if (force) toast("برنامه قبلاً مستثنا شده است"); return }
+        val sp = getSharedPreferences("p", 0)
+        if (!force && sp.getBoolean("battAsked", false)) return
+        sp.edit().putBoolean("battAsked", true).apply()
+        try {
+            startActivity(Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
+        } catch (_: Exception) {
+            try { startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) } catch (_: Exception) {}
+        }
+    }
+
     private fun show() {
         h.removeCallbacksAndMessages(null); box.removeAllViews()
         when (Intercom.role) { 0 -> roleScreen(); 1 -> masterScreen(); else -> clientScreen() }
@@ -117,6 +239,7 @@ class MainActivity : Activity() {
         val p = mutableListOf(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= 31) p += Manifest.permission.BLUETOOTH_CONNECT
         if (Build.VERSION.SDK_INT >= 33) p += Manifest.permission.POST_NOTIFICATIONS
+        if (Build.VERSION.SDK_INT < 29) p += Manifest.permission.WRITE_EXTERNAL_STORAGE
         val missing = p.filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
         if (missing.isEmpty()) then() else { afterPerm = then; requestPermissions(missing.toTypedArray(), 1) }
     }
@@ -127,11 +250,13 @@ class MainActivity : Activity() {
         afterPerm = null
     }
 
-    private fun startSvc(role: Int, host: String = "", name: String = "") {
+    private fun startSvc(role: Int, host: String = "", name: String = "", pin: String = "") {
         Intercom.role = role
-        val i = Intent(this, IntercomService::class.java).putExtra("role", role).putExtra("host", host).putExtra("name", name)
+        val i = Intent(this, IntercomService::class.java).putExtra("role", role)
+            .putExtra("host", host).putExtra("name", name).putExtra("pin", pin)
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
         show()
+        askBattery()
     }
 
     private fun stopSvc() = startService(Intent(this, IntercomService::class.java).setAction("stop"))
@@ -165,16 +290,26 @@ class MainActivity : Activity() {
     private fun roleScreen() {
         val prefs = getSharedPreferences("p", 0)
         header("")
-        add(roleCard(R.drawable.ic_mic, C_BLUE, "مستر", "کلاینت‌ها خودکار پیدا می‌شوند") { needPerms { startSvc(1) } })
-
         val ip = EditText(this).apply { hint = "IP مستر (خالی = پیدا شدن خودکار)"; setText(prefs.getString("ip", "")); layoutDirection = View.LAYOUT_DIRECTION_LTR }
         val nm = EditText(this).apply { hint = "نام شما"; setText(prefs.getString("name", Build.MODEL)) }
-        add(roleCard(R.drawable.ic_headset, C_GREEN, "کلاینت", "اتصال به مستر") {
-            prefs.edit().putString("ip", ip.text.toString().trim()).putString("name", nm.text.toString()).apply()
-            needPerms { startSvc(2, ip.text.toString().trim(), nm.text.toString().ifBlank { "کلاینت" }) }
+        val pin = EditText(this).apply {
+            hint = "رمز اتصال (اختیاری) — مستر تعیین می‌کند، کلاینت وارد می‌کند"
+            setText(prefs.getString("pin", "")); inputType = InputType.TYPE_CLASS_NUMBER; layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
+        fun save() = prefs.edit().putString("ip", ip.text.toString().trim()).putString("name", nm.text.toString())
+            .putString("pin", pin.text.toString().trim()).apply()
+
+        add(roleCard(R.drawable.ic_mic, C_BLUE, "مستر", "کلاینت‌ها خودکار پیدا می‌شوند") {
+            save(); needPerms { startSvc(1, pin = pin.text.toString().trim()) }
         })
-        val set = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; addView(ip); addView(nm); addView(credit()) }
-        add(collapsible("⚙ تنظیمات IP کلاینت", set, open = prefs.getString("ip", "").isNullOrEmpty().not()))
+        add(roleCard(R.drawable.ic_headset, C_GREEN, "کلاینت", "اتصال به مستر") {
+            save(); needPerms { startSvc(2, ip.text.toString().trim(), nm.text.toString().ifBlank { "کلاینت" }, pin.text.toString().trim()) }
+        })
+        val set = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(ip); addView(nm); addView(pin); addView(settingsSwitches(), lp(t = 8)); addView(credit())
+        }
+        add(collapsible("⚙ تنظیمات", set, open = !prefs.getString("ip", "").isNullOrEmpty()))
     }
 
     // ---------- مستر ----------
@@ -185,28 +320,81 @@ class MainActivity : Activity() {
         else toast("ابتدا باید کلاینت‌ها وصل شوند")
     }
 
+    private fun toggleRec() {
+        val m = Intercom.master ?: return
+        if (m.recorder.active) { m.stopRecording(applicationContext); toast("ضبط ذخیره شد: Download/Intercom/${m.recorder.name}") }
+        else if (m.startRecording(applicationContext)) toast("ضبط شروع شد؛ به کلاینت‌ها اعلام می‌شود")
+        else toast("شروع ضبط ممکن نشد (مجوز ذخیره‌سازی؟)")
+    }
+
+    // ---------- انتخاب و انتقال فایل ----------
+    private var filePickTarget = 0   // -1 = مستر به همه، >0 = مستر به یک کلاینت، 0 = کلاینت به مستر
+
+    private fun pickFile(target: Int) {
+        filePickTarget = target
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }
+        try { startActivityForResult(i, 77) } catch (_: Exception) { toast("انتخاب فایل ممکن نیست") }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != 77 || resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        try { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (_: Exception) {}
+        val (name, size) = FileIO.nameSize(this, uri)
+        if (size < 0) { toast("حجم فایل مشخص نیست"); return }
+        if (Intercom.role == 1) {
+            val m = Intercom.master ?: return
+            if (filePickTarget == -1) { m.sendFile(uri, name, size, null); toast("فایل برای همه پیشنهاد شد") }
+            else {
+                val s = m.sessions.firstOrNull { it.id == filePickTarget }
+                if (s == null) toast("آن کلاینت دیگر وصل نیست") else { m.sendFile(uri, name, size, s); toast("فایل برای ${s.name} پیشنهاد شد") }
+            }
+        } else if (Intercom.role == 2) {
+            Intercom.client?.uploadFile(uri, name, size)
+            toast("ارسال فایل شروع شد")
+        }
+    }
+
+    private fun blinkAnim() = AlphaAnimation(1f, 0.1f).apply { duration = 450; repeatMode = Animation.REVERSE; repeatCount = Animation.INFINITE }
+
     private fun masterScreen() {
         header("مستر")
+        val banner = label("", 13f, Color.WHITE, true).apply {
+            background = shape(C_RED, radiusDp = 12); setPadding(dp(12), dp(8), dp(12), dp(8)); visibility = View.GONE
+        }
+        add(banner)
         val myMic = IconToggle(this, R.drawable.ic_mic, R.drawable.ic_mic_off, 64) { Intercom.master?.changeMic(it) }
         myMic.on = Intercom.master?.micOpen ?: true
         val allSp = IconToggle(this, R.drawable.ic_speaker, R.drawable.ic_speaker_off, 64) { on -> Intercom.master?.sessions?.forEach { it.muted = !on } }
         val conf = IconToggle(this, R.drawable.ic_group, R.drawable.ic_group, 64, C_GREEN, C_GRAY) { Intercom.master?.conference = it }
         conf.on = Intercom.master?.conference ?: false
+        val buzzAll = IconToggle(this, R.drawable.ic_bell, R.drawable.ic_bell, 64, C_AMBER, C_AMBER, toggle = false) {
+            Intercom.master?.let { m -> m.sessions.forEach { m.buzz(it) } }
+            toast("ویبره برای همه ارسال شد")
+        }
+        val talkChip = chip("همه", C_GRAY, 64) { Intercom.master?.let { m -> m.changeTalkGroup((m.talkGroup + 1) % 5) } }
+        val rec = IconToggle(this, R.drawable.ic_rec, R.drawable.ic_rec, 64, C_RED, C_GRAY, toggle = false) { toggleRec() }
         val lock = IconToggle(this, R.drawable.ic_lock, R.drawable.ic_lock_open, 64, C_GREEN, C_AMBER, toggle = false) { lockClick() }
         lock.onHold = { Intercom.master?.fullSearch(); toast("جستجوی کلی از نو شروع شد") }
         lock.on = (Intercom.master?.lockedCount ?: 0) > 0
+        val fileAll = IconToggle(this, R.drawable.ic_file, R.drawable.ic_file, 64, C_BLUE, C_BLUE, toggle = false) { pickFile(-1) }
         val route = routeBtn(); val end = endBtn()
         val myBar = LevelBar(this)
         val status = label("", 12f, C_GRAY)
 
         val ctl = card(C_BLUE, 3)
-        ctl.addView(equalCols(col(myMic, "میکروفون من"), col(allSp, "همه کلاینت‌ها"), col(conf, "گفتگوی کلاینت‌ها")))
-        ctl.addView(equalCols(col(lock, "قفل تعداد (۳ث = جستجو)"), col(route, "خروجی"), col(end, "پایان")), lp(t = 12))
+        ctl.addView(equalCols(col(myMic, "میکروفون من"), col(allSp, "همه کلاینت‌ها"), col(conf, "گفتگوی کلاینت‌ها"), col(buzzAll, "ویبره همه")))
+        ctl.addView(equalCols(col(talkChip, "گروه مخاطب"), col(rec, "ضبط"), col(lock, "قفل (۳ث=جستجو)")), lp(t = 12))
+        ctl.addView(equalCols(col(route, "خروجی"), col(fileAll, "فایل برای همه"), col(end, "پایان")), lp(t = 12))
         ctl.addView(myBar, lp(hh = 14, t = 10))
         ctl.addView(status, lp(t = 8))
         add(ctl)
 
-        // تنظیمات IP (کشویی)
+        // پیام‌های آماده (قابل ویرایش)
+        add(collapsible("📩 پیام‌های آماده", quickMsgs { w -> Intercom.master?.sendMsg(w); toast("ارسال شد: $w") }))
+
+        // تنظیمات IP، جستجو و ...
         val ipTxt = label(localIps(), 13f).apply { layoutDirection = View.LAYOUT_DIRECTION_LTR }
         val scanTxt = label("", 12f, C_GRAY)
         val auto = IconToggle(this, R.drawable.ic_refresh, R.drawable.ic_refresh, 48, C_GREEN, C_GRAY) { Intercom.master?.autoScan = it }
@@ -214,9 +402,12 @@ class MainActivity : Activity() {
         val now = IconToggle(this, R.drawable.ic_search, R.drawable.ic_search, 48, C_BLUE, C_BLUE, toggle = false) { Intercom.master?.scanNow() }
         val ipBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         ipBox.addView(label("آدرس‌های این گوشی (پورت $PORT):", 12f, C_GRAY))
-        ipBox.addView(ipTxt, lp(b = 8))
+        ipBox.addView(ipTxt, lp(b = 4))
+        val pinNow = Intercom.master?.pin ?: ""
+        ipBox.addView(label("رمز اتصال: " + if (pinNow.isEmpty()) "ندارد" else pinNow, 13f, C_TEXT, true), lp(b = 8))
         ipBox.addView(equalCols(col(auto, "جستجوی خودکار"), col(now, "جستجوی فوری")))
         ipBox.addView(scanTxt, lp(t = 8))
+        ipBox.addView(settingsSwitches(), lp(t = 8))
         ipBox.addView(credit())
         add(collapsible("⚙ تنظیمات IP و جستجو", ipBox))
 
@@ -230,16 +421,28 @@ class MainActivity : Activity() {
                 if (Intercom.role == 0) { show(); return }
                 val m = Intercom.master
                 if (m != null) {
+                    val nowMs = System.currentTimeMillis()
                     status.text = "${m.serverStatus}  •  ${m.sessions.size} کلاینت" +
                         (if (m.lockedCount > 0) "  •  🔒 ${m.lockedCount}" else "") +
                         (if (m.conference) "  •  گفتگو فعال" else "") +
+                        (if (m.recorder.active) "  •  🔴 ضبط" else "") +
+                        (if (m.soloId != 0) "  •  🎯 فقط با ${m.sessions.firstOrNull { it.id == m.soloId }?.name ?: "?"}" else "") +
+                        (if (m.fileStatus.isNotEmpty()) "\n${m.fileStatus}" else "") +
                         (if (!m.audioOk) "\n⚠ میکروفون/اسپیکر در دسترس نیست" else "")
                     scanTxt.text = m.scanStatus
                     route.setIcon(routeIcon())
                     myBar.level = lvl(m.myLevel)
+                    myMic.on = m.micOpen
+                    rec.on = m.recorder.active
                     allSp.on = m.sessions.none { it.muted }
                     lock.on = m.lockedCount > 0
                     conf.on = m.conference
+                    if (m.talkGroup == 0) setChip(talkChip, "همه", C_GRAY) else setChip(talkChip, groupLetter(m.talkGroup), GC[m.talkGroup - 1])
+
+                    val cut = m.sessions.filter { it.clientMutedMaster }.map { it.name }
+                    if (cut.isEmpty()) banner.visibility = View.GONE
+                    else { banner.text = "🔇 قطع شد: ${cut.joinToString("، ")} صدای مستر را قطع کرده‌اند"; banner.visibility = View.VISIBLE }
+
                     val ids = m.sessions.map { it.id }
                     if (ids != shown) {
                         shown = ids; list.removeAllViews(); rows.clear()
@@ -247,10 +450,28 @@ class MainActivity : Activity() {
                         m.sessions.forEach { s -> val (v, r) = makeRow(m, s); list.addView(v, lp(b = 12)); rows[s.id] = r }
                     }
                     rows.values.forEach { r ->
-                        r.title.text = "${r.s.name}   •   ${r.s.addr}"
-                        r.bar.level = lvl(r.s.level)
-                        r.sp.on = !r.s.muted
-                        r.mic.on = r.s.hearMaster
+                        val s = r.s
+                        r.title.text = "${s.name}   •   ${s.addr}" + if (nowMs - s.lastBuzz < 3000) "   🔔" else ""
+                        r.quality.text = if (s.rtt < 0) "📶 …" else "📶 ${s.rtt}ms"
+                        r.quality.setTextColor(qColor(s.rtt))
+                        r.bar.level = lvl(s.level)
+                        r.sp.on = !s.muted
+                        r.mic.on = s.hearMaster
+                        r.solo.on = m.soloId == s.id
+                        r.ptt.on = m.pttId == s.id
+                        r.remote.on = !s.micForced
+                        setChip(r.grp, groupLetter(s.group), GC[s.group.coerceIn(1, 4) - 1])
+                        val cutIt = s.clientMutedMaster
+                        if (cutIt && !r.blinking) { r.blink.visibility = View.VISIBLE; r.blink.startAnimation(blinkAnim()); r.blinking = true }
+                        else if (!cutIt && r.blinking) { r.blink.clearAnimation(); r.blink.visibility = View.GONE; r.blinking = false }
+                        val notes = listOfNotNull(
+                            if (s.clientMutedMaster) "🔇 قطع: صدای مستر را قطع کرده" else null,
+                            if (s.micForced) "🔒 میکروفون او را بسته‌اید" else if (s.clientMicOff) "🎙 میکروفون او خاموش است" else null,
+                            if (nowMs - s.lastMsgAt < 6000) "📩 ${s.lastMsg}" else null)
+                        r.note.text = notes.joinToString("   •   ")
+                        r.note.visibility = if (notes.isEmpty()) View.GONE else View.VISIBLE
+                        if (s.clientMutedMaster && !r.prev) toast("${s.name} صدای شما را قطع کرد")
+                        r.prev = s.clientMutedMaster
                     }
                 }
                 h.postDelayed(this, 120)
@@ -264,10 +485,28 @@ class MainActivity : Activity() {
         val cc = colors[(s.id - 1) % colors.size]
         val c = card(cc, 3)
         val title = label(s.name, 16f, cc, true)
-        val sp = IconToggle(this, R.drawable.ic_speaker, R.drawable.ic_speaker_off, 60) { s.muted = !it }
+        val quality = label("📶 …", 12f, C_GRAY, true)
+        val note = label("", 12f, C_RED, true).apply { visibility = View.GONE }
+        val blink = ImageView(this).apply {
+            setImageResource(R.drawable.ic_mic_off); background = shape(C_RED, oval = true)
+            setPadding(dp(5), dp(5), dp(5), dp(5)); visibility = View.GONE
+        }
+        val sp = IconToggle(this, R.drawable.ic_speaker, R.drawable.ic_speaker_off, 56) { s.muted = !it }
         sp.on = !s.muted
-        val mic = IconToggle(this, R.drawable.ic_mic, R.drawable.ic_mic_off, 60) { m.setTalk(s, it) }
+        val mic = IconToggle(this, R.drawable.ic_mic, R.drawable.ic_mic_off, 56) { m.setTalk(s, it) }
         mic.on = s.hearMaster
+        val solo = IconToggle(this, R.drawable.ic_person, R.drawable.ic_person, 56, C_BLUE, C_GRAY, toggle = false) { m.solo(s) }
+        solo.on = m.soloId == s.id
+        val buzz = IconToggle(this, R.drawable.ic_bell, R.drawable.ic_bell, 56, C_AMBER, C_AMBER, toggle = false) {
+            m.buzz(s); toast("ویبره برای ${s.name} ارسال شد")
+        }
+        val remote = IconToggle(this, R.drawable.ic_mic, R.drawable.ic_mic_off, 56, C_GREEN, C_RED) { m.forceMic(s, !it) }
+        remote.on = !s.micForced
+        val grp = chip(groupLetter(s.group), GC[s.group.coerceIn(1, 4) - 1], 56) { m.setGroup(s, s.group % 4 + 1) }
+        val ptt = IconToggle(this, R.drawable.ic_ptt, R.drawable.ic_ptt, 56, C_GREEN, C_GRAY)
+        ptt.onPress = { d -> m.pttPress(s, d); ptt.on = d }
+        ptt.on = m.pttId == s.id
+        val file = IconToggle(this, R.drawable.ic_file, R.drawable.ic_file, 56, C_BLUE, C_BLUE, toggle = false) { pickFile(s.id) }
         val bar = LevelBar(this)
         val vol = SeekBar(this).apply {
             max = 200; progress = (s.volume * 100).toInt()
@@ -278,15 +517,20 @@ class MainActivity : Activity() {
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         }
-        val right = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), 0, 0, 0) }
-        right.addView(label("سطح صدا", 11f, C_GRAY)); right.addView(bar, lp(hh = 14, b = 6))
-        right.addView(label("ولوم", 11f, C_GRAY)); right.addView(vol)
-        c.addView(title, lp(b = 8))
-        val r = row()
-        r.addView(col(sp, "صدای او"), lp(w = -2, r = 6)); r.addView(col(mic, "صدای من"), lp(w = -2, r = 6))
-        r.addView(right, LinearLayout.LayoutParams(0, -2, 1f))
-        c.addView(r)
-        return c to Row(s, title, bar, sp, mic)
+        val low = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        low.addView(label("سطح صدا", 11f, C_GRAY)); low.addView(bar, lp(hh = 14, b = 6))
+        low.addView(label("ولوم", 11f, C_GRAY)); low.addView(vol)
+
+        val top = row()
+        top.addView(title, LinearLayout.LayoutParams(0, -2, 1f))
+        top.addView(blink, LinearLayout.LayoutParams(dp(30), dp(30)).apply { setMargins(dp(6), 0, dp(6), 0) })
+        top.addView(quality)
+        c.addView(top, lp(b = 4))
+        c.addView(note, lp(b = 6))
+        c.addView(equalCols(col(sp, "صدای او"), col(mic, "صدای من"), col(solo, "فقط او"), col(buzz, "ویبره")), lp(t = 4))
+        c.addView(equalCols(col(remote, "میکروفون او"), col(grp, "گروه"), col(ptt, "PTT"), col(file, "فایل")), lp(t = 10))
+        c.addView(low, lp(t = 10))
+        return c to Row(s, title, quality, note, bar, sp, mic, solo, remote, grp, ptt, blink)
     }
 
     // ---------- کلاینت ----------
@@ -300,10 +544,17 @@ class MainActivity : Activity() {
         sc.addView(sr)
         add(sc)
 
-        val mic = IconToggle(this, R.drawable.ic_mic, R.drawable.ic_mic_off, 64) { Intercom.client?.micMuted = !it }
+        val mic = IconToggle(this, R.drawable.ic_mic, R.drawable.ic_mic_off, 64) { on ->
+            val c = Intercom.client
+            if (c != null) { if (c.forcedMute) toast("مستر میکروفون شما را بسته است") else c.micMuted = !on }
+        }
         mic.on = !(Intercom.client?.micMuted ?: false)
         val spk = IconToggle(this, R.drawable.ic_speaker, R.drawable.ic_speaker_off, 64) { Intercom.client?.masterMuted = !it }
         spk.on = !(Intercom.client?.masterMuted ?: false)
+        val buzz = IconToggle(this, R.drawable.ic_bell, R.drawable.ic_bell, 64, C_AMBER, C_AMBER, toggle = false) {
+            Intercom.client?.buzzMaster(); toast("ویبره برای مستر ارسال شد")
+        }
+        val file = IconToggle(this, R.drawable.ic_file, R.drawable.ic_file, 64, C_BLUE, C_BLUE, toggle = false) { pickFile(0) }
         val route = routeBtn(); val end = endBtn()
         val bar = LevelBar(this)
         val vol = SeekBar(this).apply {
@@ -316,31 +567,50 @@ class MainActivity : Activity() {
             })
         }
         val ctl = card(C_GREEN, 3)
-        ctl.addView(equalCols(col(mic, "میکروفون من"), col(spk, "صدای مستر"), col(route, "خروجی"), col(end, "قطع")))
+        ctl.addView(equalCols(col(mic, "میکروفون من"), col(spk, "صدای مستر"), col(buzz, "ویبره")))
+        ctl.addView(equalCols(col(route, "خروجی"), col(file, "ارسال فایل"), col(end, "قطع")), lp(t = 12))
         ctl.addView(label("سطح صدای من", 11f, C_GRAY), lp(t = 10))
         ctl.addView(bar, lp(hh = 14, t = 2))
         ctl.addView(label("ولوم صدای مستر", 11f, C_GRAY), lp(t = 10))
         ctl.addView(vol)
         add(ctl)
 
+        add(collapsible("📩 پیام‌های آماده", quickMsgs { w -> Intercom.client?.sendMsg(w); toast("ارسال شد: $w") }))
+
+        val prefs = getSharedPreferences("p", 0)
         val ip = EditText(this).apply { hint = "IP مستر (خالی = خودکار)"; setText(Intercom.client?.host ?: ""); layoutDirection = View.LAYOUT_DIRECTION_LTR }
+        val pin = EditText(this).apply {
+            hint = "رمز اتصال"; setText(Intercom.client?.pin ?: ""); inputType = InputType.TYPE_CLASS_NUMBER; layoutDirection = View.LAYOUT_DIRECTION_LTR
+        }
         val apply = IconToggle(this, R.drawable.ic_refresh, R.drawable.ic_refresh, 48, C_BLUE, C_BLUE, toggle = false) {
-            Intercom.client?.reconnect(ip.text.toString())
+            prefs.edit().putString("pin", pin.text.toString().trim()).apply()
+            Intercom.client?.reconnect(ip.text.toString(), pin.text.toString())
         }
         val ipBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        ipBox.addView(ip); ipBox.addView(col(apply, "اتصال مجدد"), lp(t = 6))
+        ipBox.addView(ip); ipBox.addView(pin); ipBox.addView(col(apply, "اتصال مجدد"), lp(t = 6))
+        ipBox.addView(settingsSwitches(), lp(t = 8))
         ipBox.addView(credit())
-        add(collapsible("⚙ تنظیمات IP", ipBox))
+        add(collapsible("⚙ تنظیمات", ipBox))
 
         val tick = object : Runnable {
             override fun run() {
                 if (Intercom.role == 0) { show(); return }
                 Intercom.client?.let {
-                    status.text = it.status + "\nمسیر صدا: ${Intercom.router?.routeName}" +
-                        (if (it.status == "متصل" && !it.masterTalking) "\n(مستر فعلاً با شما صحبت نمی‌کند)" else "") +
-                        (if (!it.audioOk) "\n⚠ میکروفون/اسپیکر در دسترس نیست" else "")
-                    dot.setTextColor(when { it.status == "متصل" -> C_GREEN; it.status.startsWith("قطع") -> C_RED; else -> C_AMBER })
+                    val now = System.currentTimeMillis()
+                    val sb = StringBuilder(it.status)
+                    sb.append("\nمسیر صدا: ${Intercom.router?.routeName}")
+                    if (it.status == "متصل") sb.append("   •   گروه ${groupLetter(it.group)}")
+                    if (it.status == "متصل" && !it.masterTalking) sb.append("\n(مستر فعلاً با شما صحبت نمی‌کند)")
+                    if (it.recording) sb.append("\n🔴 این مکالمه ضبط می‌شود")
+                    if (it.forcedMute) sb.append("\n🔒 مستر میکروفون شما را بسته است")
+                    if (now - it.lastBuzz < 3000) sb.append("\n🔔 مستر شما را صدا زد")
+                    if (now - it.lastMsgAt < 6000) sb.append("\n📩 مستر: ${it.lastMsg}")
+                    if (it.fileStatus.isNotEmpty()) sb.append("\n${it.fileStatus}")
+                    if (!it.audioOk) sb.append("\n⚠ میکروفون/اسپیکر در دسترس نیست")
+                    status.text = sb.toString()
+                    dot.setTextColor(when { it.status == "متصل" -> C_GREEN; it.status.startsWith("رمز") || it.status.startsWith("قطع") -> C_RED; else -> C_AMBER })
                     bar.level = lvl(it.level)
+                    mic.on = !(it.micMuted || it.forcedMute)
                     route.setIcon(routeIcon())
                 }
                 h.postDelayed(this, 120)

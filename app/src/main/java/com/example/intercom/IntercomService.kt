@@ -12,6 +12,7 @@ import android.os.Looper
 import android.os.PowerManager
 
 object Intercom {
+    @Volatile var appCtx: Context? = null
     @Volatile var role = 0              // 0 هیچ، 1 مستر، 2 کلاینت
     var master: MasterEngine? = null
     var client: ClientEngine? = null
@@ -35,12 +36,21 @@ class IntercomService : Service() {
     }
 
     private fun begin(role: Int, i: Intent) {
+        val sp = getSharedPreferences("p", 0)
+        Cfg.compress = sp.getBoolean("compress", true)
+        Cfg.noise = sp.getBoolean("noise", true)
+        Cfg.buzzBeep = sp.getBoolean("buzzBeep", false)
+        Intercom.appCtx = applicationContext
         val io = AudioIO()
         val router = AudioRouter(this) { h.postDelayed({ io.restart() }, 1200) } // زمان برای SCO
         router.start(); io.open()
         Intercom.io = io; Intercom.router = router
-        if (role == 1) Intercom.master = MasterEngine(io).also { it.start() }
-        else Intercom.client = ClientEngine(io, i.getStringExtra("host") ?: "", i.getStringExtra("name") ?: "کلاینت").also { it.start() }
+        if (role == 1) Intercom.master = MasterEngine(io, i.getStringExtra("pin") ?: "").also {
+            it.onBuzz = { buzzPhone(this@IntercomService) }; it.onAlert = { alertPhone(this@IntercomService) }; it.start()
+        }
+        else Intercom.client = ClientEngine(io, i.getStringExtra("host") ?: "", i.getStringExtra("name") ?: "کلاینت", i.getStringExtra("pin") ?: "").also {
+            it.onBuzz = { buzzPhone(this@IntercomService) }; it.onAlert = { alertPhone(this@IntercomService) }; it.start()
+        }
         Intercom.role = role
 
         wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)
@@ -51,7 +61,7 @@ class IntercomService : Service() {
     }
 
     private fun shutdown() {
-        Intercom.master?.stop(); Intercom.client?.stop()
+        Intercom.master?.let { it.stopRecording(this); it.stop() }; Intercom.client?.stop()
         Intercom.io?.close(); Intercom.router?.stop()
         Intercom.master = null; Intercom.client = null; Intercom.io = null; Intercom.router = null
         Intercom.role = 0

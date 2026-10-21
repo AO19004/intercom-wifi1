@@ -3,6 +3,8 @@ package com.example.intercom
 import android.content.Context
 import android.media.*
 import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -14,6 +16,8 @@ class AudioIO {
     @Volatile private var rec: AudioRecord? = null
     @Volatile private var trk: AudioTrack? = null
     private var aec: AcousticEchoCanceler? = null
+    private var ns: NoiseSuppressor? = null
+    private var agc: AutomaticGainControl? = null
 
     @Synchronized fun open() {
         close()
@@ -23,6 +27,10 @@ class AudioIO {
         if (r.state != AudioRecord.STATE_INITIALIZED) { r.release(); return }
         if (AcousticEchoCanceler.isAvailable())
             aec = AcousticEchoCanceler.create(r.audioSessionId)?.also { it.enabled = true }
+        if (Cfg.noise) {
+            if (NoiseSuppressor.isAvailable()) ns = NoiseSuppressor.create(r.audioSessionId)?.also { it.enabled = true }
+            if (AutomaticGainControl.isAvailable()) agc = AutomaticGainControl.create(r.audioSessionId)?.also { it.enabled = true }
+        }
         r.startRecording()
 
         val tb = max(FRAME * 8, AudioTrack.getMinBufferSize(RATE, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT))
@@ -42,6 +50,8 @@ class AudioIO {
     @Synchronized fun close() {
         rec?.let { try { it.stop() } catch (_: Exception) {}; it.release() }; rec = null
         aec?.release(); aec = null
+        ns?.release(); ns = null
+        agc?.release(); agc = null
         trk?.let { try { it.stop() } catch (_: Exception) {}; it.release() }; trk = null
     }
 
